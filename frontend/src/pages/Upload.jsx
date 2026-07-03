@@ -183,19 +183,6 @@ const Upload = () => {
 
   return (
     <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8 md:py-12" data-testid="upload-page">
-      {/* Demo Mode Banner */}
-      <div className="mb-6 bg-amber-50 border border-amber-200 rounded-xl p-4">
-        <div className="flex items-start gap-3">
-          <div className="h-8 w-8 rounded-lg bg-amber-100 text-amber-800 flex items-center justify-center shrink-0 text-lg">🔬</div>
-          <div>
-            <div className="font-medium text-amber-900">Demo Mode</div>
-            <div className="text-sm text-amber-700 mt-1">
-              This is a demo showcase with pre-loaded sample data. OCR processing is disabled. 
-              Click <strong>"Try with sample papers"</strong> to explore the analysis, or navigate from the sidebar.
-            </div>
-          </div>
-        </div>
-      </div>
 
       <div className="mb-8 flex flex-col md:flex-row md:items-end justify-between gap-3">
         <div>

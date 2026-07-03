@@ -1,65 +1,63 @@
-"""Parse teacher-submitted answer key text into structured question JSON.
+"""Parse teacher-submitted answer key and questions text into structured JSON.
 
-Uses Ollama (Llama 3.2) to extract per-question answers from free-form
-text that the teacher pastes into the Upload page.
+Uses heuristic parsing first (fast, offline).
+Falls back to OpenRouter LLM for complex/ambiguous formats.
 """
 
 import json
 import re
-import httpx
 from typing import List, Dict, Optional, Any
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "llama3.2:3b"
+from backend.core.config import settings
 
+
+def _call_openrouter(prompt: str, max_tokens: int = 4000) -> str:
+    """Call OpenRouter with the text model (no vision needed)."""
+    from openai import OpenAI
+    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=settings.OPENROUTER_API_KEY)
+    model = settings.TEXT_MODEL.lstrip("~")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        max_tokens=max_tokens,
+        extra_headers={"X-No-Cache": "true"},
+    )
+    return response.choices[0].message.content.strip()
+
+
+# ---------------------------------------------------------------------------
+# Answer Key Parsing
+# ---------------------------------------------------------------------------
 
 def parse_answer_key(text: str) -> List[Dict[str, Any]]:
-    """Parse free-text answer key into structured question array.
-
-    Accepts formats like:
-    - "1. A  2. C  3. B  ..."
-    - "Q1: Humans (option A)  Q2: Done when oviducts are blocked..."
-    - "1. Human -> B  2. IVF -> C  ..."
-    - "11. Weeds are unwanted plants. Controlled by weeding.  12. No..."
-    - "11) Weeds = unwanted plants, controlled by weeding..."
+    """Parse free-text answer key into structured array.
 
     Returns list of {questionNumber, correctAnswer, correctOption, expectedText}.
     """
-
-    # Try heuristic extraction first (fast, no API call)
-    heuristic = _heuristic_parse(text)
+    heuristic = _heuristic_parse_key(text)
     if heuristic and len(heuristic) >= 3:
         return heuristic
 
-    # Fall back to Ollama for complex answer keys
+    # Fall back to LLM
     try:
-        ollama_result = _ollama_parse(text)
-        if ollama_result:
-            return ollama_result
-    except Exception:
-        pass
-
-    # If Ollama failed and heuristic found anything at all, return it
-    return heuristic if heuristic else []
+        return _llm_parse_answer_key(text) or heuristic or []
+    except Exception as e:
+        print(f"  LLM answer key parsing failed: {e}")
+        return heuristic or []
 
 
-def _heuristic_parse(text: str) -> List[Dict[str, Any]]:
+def _heuristic_parse_key(text: str) -> List[Dict[str, Any]]:
     """Fast rule-based extraction of MCQ and short-answer keys."""
     results = []
     lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        # Pattern: "1. A" or "1) B" or "1. A) Human" or "Q1. Human"
-        # MCQ first: match number then letter
+    for line in lines:
+        # MCQ: "1. A" or "1) B" or "Q1. A"
         mcq = re.match(r'^Q?\s*(\d{1,2})\s*[.)\s]\s*([A-Da-d])\b', line)
         if mcq:
             q_num = int(mcq.group(1))
             letter = mcq.group(2).upper()
-            # Extract the answer text after the letter if present
             rest = line[mcq.end():].strip()
             answer_text = rest if rest and len(rest) > 1 else f"Option {letter}"
             results.append({
@@ -70,7 +68,7 @@ def _heuristic_parse(text: str) -> List[Dict[str, Any]]:
             })
             continue
 
-        # Subjective: "11. Weeds are unwanted plants..." (no letter after number)
+        # Subjective: "11. Weeds are unwanted plants..."
         subj = re.match(r'^Q?\s*(\d{1,2})\s*[.)]\s+(.+)$', line)
         if subj:
             q_num = int(subj.group(1))
@@ -81,7 +79,6 @@ def _heuristic_parse(text: str) -> List[Dict[str, Any]]:
                 "correctAnswer": answer_text,
                 "expectedText": answer_text,
             })
-            continue
 
     if len(results) >= 3:
         results.sort(key=lambda r: r["questionNumber"])
@@ -89,225 +86,191 @@ def _heuristic_parse(text: str) -> List[Dict[str, Any]]:
     return []
 
 
-def _ollama_parse(text: str) -> List[Dict[str, Any]]:
-    """Use Ollama to parse complex answer key text."""
-    prompt = f"""Parse the following answer key into a JSON array. Each item has:
+def _llm_parse_answer_key(text: str) -> List[Dict[str, Any]]:
+    prompt = f"""Parse the following answer key into a JSON array. Each item must have:
 - questionNumber: int
 - correctOption: "A"/"B"/"C"/"D" or null (only for MCQs)
 - correctAnswer: the correct answer text
-- expectedText: what a good student answer should look like
+- expectedText: what a good student answer should contain
 
-ANSWER KEY TEXT:
+ANSWER KEY:
 {text[:5000]}
 
-Return ONLY a JSON array. No markdown, no explanation."""
+Return ONLY a valid JSON array. No markdown, no explanation."""
 
-    try:
-        resp = httpx.post(
-            OLLAMA_URL,
-            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "temperature": 0.0},
-            timeout=120,
-        )
-        resp.raise_for_status()
-        response_text = resp.json().get("response", "").strip()
-
-        json_start = response_text.find("[")
-        json_end = response_text.rfind("]")
-        if json_start >= 0 and json_end > json_start:
-            parsed = json.loads(response_text[json_start:json_end + 1])
-            if isinstance(parsed, list) and len(parsed) >= 1:
-                return parsed
-    except Exception as e:
-        print(f"  Ollama answer key parsing failed: {e}")
-
+    response_text = _call_openrouter(prompt, max_tokens=3000)
+    j0 = response_text.find("[")
+    j1 = response_text.rfind("]")
+    if j0 >= 0 and j1 > j0:
+        parsed = json.loads(response_text[j0:j1 + 1])
+        if isinstance(parsed, list) and len(parsed) >= 1:
+            return parsed
     return []
 
 
+# ---------------------------------------------------------------------------
+# Questions Text Parsing
+# ---------------------------------------------------------------------------
+
 def parse_questions_text(text: str) -> List[Dict[str, Any]]:
-    """Parse teacher-submitted questions text into structured question array.
-
-    Returns list matching the questions.json schema:
-    {id, number, section, maxMarks, text, options[], correctAnswer, expected}
-    """
-
-    # Try heuristic parse first (for instant offline result!)
+    """Parse teacher-submitted questions text into structured question array."""
     heuristic = _heuristic_parse_questions(text)
-    if heuristic and len(heuristic) >= 5:
-        print(f"  Heuristically parsed {len(heuristic)} questions successfully.")
-        return heuristic
 
-    prompt = f"""Parse these exam questions into a JSON array. Each item should have:
-- number: int (question number, starting from 1)
-- text: string (the question text)
-- section: "A"/"B"/"C"/"D" based on the mark weight or explicitly stated section
-- maxMarks: int (estimated marks based on question complexity: 1 for MCQs/simple, 2-4 for short, 8 for essay)
-- options: array of strings (if MCQ, 4 options; otherwise empty array)
-- correctAnswer: string (if the answer is provided, the correct answer text; otherwise null)
-- expected: string (if provided in the text, the expected answer; otherwise null)
+    # Only trust heuristic if it got reasonable results
+    # Sanity check: unique question numbers, reasonable count
+    if heuristic:
+        nums = [q["number"] for q in heuristic]
+        unique = len(set(nums)) == len(nums)
+        reasonable = 5 <= len(heuristic) <= 30
+        if unique and reasonable:
+            print(f"  Heuristically parsed {len(heuristic)} questions.")
+            return heuristic
 
-If you see answer key mixed in with questions, extract that as the correctAnswer field.
-If no answers are provided, set correctAnswer and expected to null.
+    # Fall back to LLM
+    print(f"  Heuristic parse gave {len(heuristic)} questions — falling back to LLM...")
+    try:
+        llm_result = _llm_parse_questions(text)
+        if llm_result:
+            return llm_result
+    except Exception as e:
+        print(f"  LLM questions parsing failed: {e}")
 
-QUESTIONS TEXT:
+    return heuristic or []
+
+
+def _llm_parse_questions(text: str) -> List[Dict[str, Any]]:
+    prompt = f"""Parse the following exam question paper into a JSON array.
+
+Each question must have:
+- number: int (the question number, e.g. 1, 2, ... 17)
+- text: string (the question text only, no options)
+- section: "A", "B", "C", or "D"
+- maxMarks: int (1 for section A, 2 for B, 4 for C, 8 for D)
+- options: array of 4 strings if MCQ (just the option text, no A/B/C/D prefix), else empty array []
+- correctAnswer: null (leave blank, answer key is separate)
+- expected: null
+
+Important rules:
+- Count each numbered question ONCE. Sub-items (i, ii, iii, iv) are part of one question, not separate questions.
+- Header lines like "SECTION A", "Total Marks: 40" are NOT questions.
+- Option lines like "A) Frog  B) Butterfly" belong to the question above them.
+- The paper has exactly the questions that are numbered (1, 2, 3... up to the last number you see).
+
+QUESTION PAPER:
 {text[:8000]}
 
-Return ONLY a JSON array. No markdown, no explanation."""
+Return ONLY a valid JSON array. No markdown, no explanation."""
 
-    try:
-        resp = httpx.post(
-            OLLAMA_URL,
-            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "temperature": 0.0},
-            timeout=120,
-        )
-        resp.raise_for_status()
-        response_text = resp.json().get("response", "").strip()
-
-        json_start = response_text.find("[")
-        json_end = response_text.rfind("]")
-        if json_start >= 0 and json_end > json_start:
-            parsed = json.loads(response_text[json_start:json_end + 1])
-            if isinstance(parsed, list) and len(parsed) >= 1:
-                for i, q in enumerate(parsed):
-                    q["id"] = q.get("id", f"q{q.get('number', i + 1)}")
-                    q["_id"] = q.get("id")
-                    q["assessmentId"] = "__parsed__"
-                return parsed
-    except Exception as e:
-        print(f"  Ollama questions parsing failed: {e}")
-
-    return heuristic if heuristic else []
+    response_text = _call_openrouter(prompt, max_tokens=4000)
+    j0 = response_text.find("[")
+    j1 = response_text.rfind("]")
+    if j0 >= 0 and j1 > j0:
+        parsed = json.loads(response_text[j0:j1 + 1])
+        if isinstance(parsed, list) and len(parsed) >= 1:
+            for i, q in enumerate(parsed):
+                q["id"] = f"q{q.get('number', i + 1)}"
+                q["_id"] = q["id"]
+                q["assessmentId"] = "__parsed__"
+                if "options" not in q:
+                    q["options"] = []
+                if "correctAnswer" not in q:
+                    q["correctAnswer"] = None
+                if "expected" not in q:
+                    q["expected"] = None
+            return parsed
+    return []
 
 
 def _heuristic_parse_questions(text: str) -> List[Dict[str, Any]]:
-    """Heuristically parse free-text questions into structured Question format."""
+    """Heuristically parse free-text questions — conservative, only numbered lines."""
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     questions = []
-    q_num = 1
+    current_q = None
+
+    SECTION_MARKS = {"A": 1, "B": 2, "C": 4, "D": 8}
     current_section = "A"
 
-    def is_valid_question_line(line):
-        lower = line.lower()
-        if "section" in lower and ("answer" in lower or "multiple" in lower or "questions" in lower or "booklet" in lower):
-            return False
-        if "self assessment" in lower or "udise" in lower:
-            return False
-        if len(line) < 15:
-            return False
-        return True
-
     for line in lines:
-        lower_line = line.lower()
-        if "section b" in lower_line:
-            current_section = "B"
-            continue
-        elif "section c" in lower_line:
-            current_section = "C"
-            continue
-        elif "section d" in lower_line:
-            current_section = "D"
+        lower = line.lower()
+
+        # Detect section headers
+        if re.match(r'^section\s+[a-d]\b', lower):
+            m = re.search(r'section\s+([a-d])', lower)
+            if m:
+                current_section = m.group(1).upper()
             continue
 
-        if not is_valid_question_line(line):
+        # Skip pure header/meta lines (no leading number)
+        if not re.match(r'^[Qq]?\s*\d', line):
+            # Could be option line for current question
+            opts = re.findall(r'[A-D]\)\s*([^A-D\n]+?)(?=\s+[A-D]\)|$)', line)
+            if opts and current_q is not None and not current_q.get("options"):
+                current_q["options"] = [o.strip() for o in opts]
             continue
 
-        # Pattern for "16. A)" or "1." or "16)"
-        num_match = re.match(r'^(?:Q|q)?(\d{1,2})\s*[\.?)\s-]*\s*([A-Ba-b])?[\.?)\s-]*\s*(.+)$', line)
+        # Numbered question line
+        m = re.match(r'^[Qq]?\s*(\d{1,2})\s*[.)]\s*(.+)$', line)
+        if not m:
+            continue
 
-        q_text = line
-        custom_num = None
-        if num_match:
-            custom_num = int(num_match.group(1))
-            suffix = num_match.group(2) or ""
-            q_text = num_match.group(3).strip()
-            if suffix:
-                q_text = f"{suffix}) {q_text}"
+        q_num = int(m.group(1))
+        q_text = m.group(2).strip()
 
-        options = []
-        if current_section == "A" or "A)" in q_text:
-            opts_match = re.findall(r'([A-D])\s*\)\s*([^A-D\n]+)', q_text)
-            if len(opts_match) >= 2:
-                options = [f"{o[0]}) {o[1].strip()}" for o in opts_match]
-                q_text = re.split(r'\b[A-D]\s*\)', q_text)[0].strip()
-
-        actual_num = custom_num if custom_num else q_num
-
-        if actual_num <= 10:
+        # Determine section from number if not set by header
+        if q_num <= 10:
             sect = "A"
-            marks = 1
-        elif actual_num <= 13:
+        elif q_num <= 13:
             sect = "B"
-            marks = 2
-        elif actual_num <= 15:
+        elif q_num <= 15:
             sect = "C"
-            marks = 4
         else:
             sect = "D"
-            marks = 8
 
-        questions.append({
-            "id": f"q{actual_num}",
-            "_id": f"q{actual_num}",
-            "number": actual_num,
+        # Check for inline options: "1. Question text A) opt B) opt..."
+        inline_opts = re.findall(r'([A-D])\)\s*([^A-D\n]+?)(?=\s+[A-D]\)|$)', q_text)
+        options = []
+        if inline_opts:
+            options = [o[1].strip() for o in inline_opts]
+            q_text = re.split(r'\s+[A-D]\)', q_text)[0].strip()
+
+        current_q = {
+            "id": f"q{q_num}",
+            "_id": f"q{q_num}",
+            "number": q_num,
             "section": sect,
-            "maxMarks": marks,
+            "maxMarks": SECTION_MARKS.get(sect, 1),
             "text": q_text,
             "options": options,
             "correctAnswer": None,
             "expected": None,
-            "assessmentId": "__parsed__"
-        })
-
-        q_num = actual_num + 1
+            "assessmentId": "__parsed__",
+        }
+        questions.append(current_q)
 
     return questions
 
 
+# ---------------------------------------------------------------------------
+# Curriculum Parsing (heuristic only — low stakes)
+# ---------------------------------------------------------------------------
+
 def parse_curriculum_text(text: str) -> List[Dict[str, Any]]:
-    """Parse teacher-provided curriculum/chapter summary text.
-
-    Accepts formats like:
-    - "Chapter 1: Cell Structure - cell membrane, cytoplasm, nucleus"
-    - "Topic: Fertilization (External vs Internal)"
-    - Bullet lists of concepts under chapter headers
-    - "ch1: Cell Structure -> cell wall, cell membrane, nucleus, cytoplasm"
-
-    Returns list matching curriculum chapters format:
-    [{id, name, concepts: [{name, keywords, description}]}]
-    """
-
-    # Try heuristic first
-    heuristic = _heuristic_parse_curriculum(text)
-    if heuristic and len(heuristic) >= 1:
-        return heuristic
-
-    # Fallback to Ollama
-    return _ollama_parse_curriculum(text)
-
-
-def _heuristic_parse_curriculum(text: str) -> List[Dict[str, Any]]:
-    """Heuristically parse curriculum text into chapters/concepts."""
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     chapters = []
     current_chapter = None
     ch_counter = 0
-
-    # Color palette for chapters
     colors = ["blue", "emerald", "amber", "rose", "violet", "orange", "teal"]
 
     for line in lines:
-        # Detect chapter headers: "Chapter 1: Cell Structure", "Ch1: ...", "1. Cell..."
-        ch_match = re.match(
-            r'^(?:Chapter|Ch|Lesson)\s*(\d+)[:\-.\s)]+\s*(.+)$', line, re.IGNORECASE
-        )
+        ch_match = re.match(r'^(?:Chapter|Ch|Lesson)\s*(\d+)[:\-.\s)]+\s*(.+)$', line, re.IGNORECASE)
         if not ch_match:
             ch_match = re.match(r'^(\d+)\.\s*(.+?)(?:\s*[-–—]\s*.+)?$', line)
 
         if ch_match:
             ch_counter += 1
-            ch_name = ch_match.group(2).strip()
             current_chapter = {
                 "id": f"ch{ch_counter}",
-                "name": ch_name[:80],
+                "name": ch_match.group(2).strip()[:80],
                 "order": ch_counter,
                 "color": colors[(ch_counter - 1) % len(colors)],
                 "concepts": [],
@@ -315,66 +278,20 @@ def _heuristic_parse_curriculum(text: str) -> List[Dict[str, Any]]:
             chapters.append(current_chapter)
             continue
 
-        # Detect topic/concept lines: "- Cell Structure", "* Fertilization", "Topic: ..."
         concept_match = re.match(r'^[-*•]\s*(.+)$', line)
         if not concept_match:
             concept_match = re.match(r'^(?:Topic|Concept|Sub-topic)[:\s]+(.+)$', line, re.IGNORECASE)
 
         if concept_match and current_chapter is not None:
             concept_text = concept_match.group(1).strip()
-            # Split by comma for keywords
             parts = [p.strip() for p in concept_text.split(",")]
-            name = parts[0][:60] if parts else concept_text[:60]
-            keywords = parts[1:4] if len(parts) > 1 else []
-
             current_chapter["concepts"].append({
-                "name": name,
-                "keywords": keywords,
+                "name": parts[0][:60],
+                "keywords": parts[1:4],
                 "description": concept_text[:200],
                 "prerequisites": [],
                 "difficulty": "Medium",
                 "expectedSkills": ["Recall"],
             })
-            continue
-
-        # If line has substantial text and we already have a chapter, treat as description
-        if current_chapter is not None and len(line) > 20 and current_chapter["concepts"]:
-            current_chapter["concepts"][-1]["description"] += " " + line
 
     return chapters
-
-
-def _ollama_parse_curriculum(text: str) -> List[Dict[str, Any]]:
-    """Use Ollama to parse curriculum text into structured JSON."""
-    prompt = f"""Parse this curriculum / chapter summary into a JSON array of chapters.
-
-Each chapter has:
-- id: "ch1", "ch2", etc.
-- name: chapter title
-- order: number
-- color: one of ["blue", "emerald", "amber", "rose", "violet", "orange", "teal"]
-- concepts: array of {{name, keywords: [string], description, prerequisites: [], difficulty: "Easy"/"Medium"/"Hard", expectedSkills: ["Recall"]}}
-
-CURRICULUM TEXT:
-{text[:8000]}
-
-Return ONLY a JSON array. No markdown, no explanation."""
-
-    try:
-        import httpx
-        resp = httpx.post(
-            "http://localhost:11434/api/generate",
-            json={"model": "llama3.2:3b", "prompt": prompt, "stream": False, "temperature": 0.0},
-            timeout=120,
-        )
-        resp.raise_for_status()
-        response_text = resp.json().get("response", "").strip()
-        json_start = response_text.find("[")
-        json_end = response_text.rfind("]")
-        if json_start >= 0 and json_end > json_start:
-            parsed = json.loads(response_text[json_start:json_end + 1])
-            if isinstance(parsed, list) and len(parsed) >= 1:
-                return parsed
-    except Exception as e:
-        print(f"  Ollama curriculum parsing failed: {e}")
-    return []

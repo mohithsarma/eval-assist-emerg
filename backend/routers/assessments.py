@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, BackgroundTasks
 from typing import List, Optional
 from backend.core.database import get_db
+from backend.core.config import settings
 from backend.models.assessment import Assessment, AssessmentCreate, AssessmentProcessRequest
 from datetime import datetime, timezone
 import uuid
@@ -34,10 +35,77 @@ def _save_uploaded_files(assessment_id: str, files: List[UploadFile], subdir: st
     return saved
 
 
-@router.get("/", response_model=List[Assessment])
+@router.get("", response_model=List[Assessment])
 async def get_assessments(db=Depends(get_db)):
     assessments = await db.assessments.find().to_list(100)
     return assessments
+
+
+@router.get("/seed")
+async def seed_database(db=Depends(get_db)):
+    """Seed the database with demo data. Call this once after deployment."""
+    seed_dir = os.path.join(os.path.dirname(__file__), "..", "seed")
+
+    await db.curricula.delete_many({})
+    await db.assessments.delete_many({})
+    await db.questions.delete_many({})
+    await db.students.delete_many({})
+    await db.evaluations.delete_many({})
+    await db.interventions.delete_many({})
+    await db.users.delete_many({})
+
+    hashed = bcrypt.hashpw("demo1234".encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    await db.users.insert_one({
+        "_id": "teacher-1",
+        "name": "Lakshmi Devi",
+        "email": "teacher@school.gov.in",
+        "school": "Z.P. High School, Hyderabad",
+        "subjects": ["Biology", "Physics"],
+        "password_hash": hashed,
+    })
+
+    curr_path = os.path.join(seed_dir, "curriculum", "ap-class8-bio.json")
+    if os.path.exists(curr_path):
+        with open(curr_path) as f:
+            await db.curricula.insert_one(json.load(f))
+
+    data_dir = os.path.join(seed_dir, "data")
+    for filename, collection_name in [
+        ("assessments.json", "assessments"),
+        ("questions.json", "questions"),
+        ("students.json", "students"),
+        ("evaluations.json", "evaluations"),
+        ("interventions.json", "interventions"),
+    ]:
+        filepath = os.path.join(data_dir, filename)
+        if not os.path.exists(filepath):
+            continue
+        with open(filepath) as f:
+            docs = json.load(f)
+        if isinstance(docs, dict):
+            items = []
+            for student_id, student_evals in docs.items():
+                for e in student_evals:
+                    e["_id"] = f"{student_id}-{e['qId']}"
+                    e["assessmentId"] = "asm-001"
+                    e["studentId"] = student_id
+                    e["approved"] = False
+                    items.append(e)
+            if items:
+                await db[collection_name].insert_many(items)
+        elif isinstance(docs, list):
+            for d in docs:
+                if "id" in d:
+                    d["_id"] = d.pop("id")
+                if collection_name != "assessments":
+                    d["assessmentId"] = "asm-001"
+            if docs:
+                await db[collection_name].insert_many(docs)
+
+    return {
+        "status": "ok",
+        "message": "Database seeded successfully. Login: teacher@school.gov.in / demo1234",
+    }
 
 
 @router.get("/{id}", response_model=Assessment)
@@ -48,7 +116,7 @@ async def get_assessment(id: str, db=Depends(get_db)):
     return assessment
 
 
-@router.post("/", response_model=Assessment)
+@router.post("", response_model=Assessment)
 async def create_assessment(
     db=Depends(get_db),
     name: str = Form(...),
@@ -241,10 +309,9 @@ async def _run_ocr_pipeline(
 
     try:
         from backend.core.database import get_db as _get_db
+        from backend.services.vision_ocr_service import extract_answers_from_image, grade_answers
 
         db = _get_db()
-
-        from tools.ocr.answer_sheet_ocr import AnswerSheetProcessor
 
         # Build the list of answer sheet image paths
         sheet_dir = os.path.join(
@@ -257,7 +324,6 @@ async def _run_ocr_pipeline(
         ] if os.path.exists(sheet_dir) else []
 
         if not sheet_paths:
-            # Fall back to path stored in assessment document
             sheet_paths = [
                 os.path.join(os.path.dirname(__file__), "..", "..", img)
                 for img in assessment.get("sheetImages", [])
@@ -270,40 +336,34 @@ async def _run_ocr_pipeline(
             )
             return
 
-        # Use parsed answer key if available, otherwise seed questions
         parsed_key = assessment.get("parsedAnswerKey")
         parsed_questions = assessment.get("parsedQuestions")
 
-        processor = AnswerSheetProcessor(language="en")
-
+        # Load questions — use parsed ones or fall back to seed questions
         if parsed_questions:
-            processor.questions = parsed_questions
+            questions = parsed_questions
+            for q in questions:
+                q["assessmentId"] = assessment_id
+                q["_id"] = q.get("_id", f"q-{assessment_id}-{q.get('number', 0)}")
+                await db.questions.update_one({"_id": q["_id"]}, {"$set": q}, upsert=True)
         else:
             questions_path = str(
                 Path(__file__).resolve().parents[2]
                 / "backend" / "seed" / "data" / "questions.json"
             )
-            if os.path.exists(questions_path):
-                processor.mapper.load_questions(questions_path)
+            with open(questions_path) as f:
+                questions = json.load(f)
 
-        # If parsed questions, also save to questions collection
-        if parsed_questions:
-            for q in parsed_questions:
-                q["assessmentId"] = assessment_id
-                q["_id"] = q.get("_id", f"q-{assessment_id}-{q.get('number', 0)}")
-                await db.questions.update_one(
-                    {"_id": q["_id"]},
-                    {"$set": q},
-                    upsert=True,
-                )
+        api_key = settings.OPENROUTER_API_KEY
+        model = settings.VISION_MODEL
 
-        # [Step 1/6] Scanning handwriting (OCR)
+        # [Step 1/6] Scanning handwriting via Vision LLM
         await db.assessments.update_one(
             {"_id": assessment_id},
             {"$set": {"processingStatus": "step_ocr"}}
         )
 
-        # Group sheet paths by student name
+        # Group sheet paths by student name (from filename)
         student_groups = {}
         for path in sheet_paths:
             base_fname = os.path.basename(path)
@@ -315,35 +375,33 @@ async def _run_ocr_pipeline(
                 student_groups[student_name] = []
             student_groups[student_name].append(path)
 
-        # Process each student's sheets separately
+        # Process each student via Vision LLM
         all_student_evaluations = []
         for student_name, student_paths in student_groups.items():
             student_id = f"stu-{assessment_id}-{student_name.lower()}"
+            print(f"\n  Processing {student_name} ({len(student_paths)} page(s)) via {model}...")
 
-            result = await asyncio.to_thread(
-                processor.process,
-                image_paths=student_paths,
-                student_id=student_id,
-                use_ollama=False,
+            structured = await asyncio.to_thread(
+                extract_answers_from_image,
+                student_paths,
+                questions,
+                api_key,
+                model,
             )
 
-            # Save extracted evaluations to MongoDB
-            evaluations = result.get("evaluations", [])
+            evaluations = grade_answers(structured, questions, parsed_key, api_key, model)
+
             for ev in evaluations:
                 ev["_id"] = f"{assessment_id}-{student_id}-{ev['qId']}"
                 ev["assessmentId"] = assessment_id
                 ev["studentId"] = student_id
                 ev["approved"] = False
+                await db.evaluations.update_one(
+                    {"_id": ev["_id"]}, {"$set": ev}, upsert=True
+                )
 
-            if evaluations:
-                # Upsert evaluations
-                for ev in evaluations:
-                    await db.evaluations.update_one(
-                        {"_id": ev["_id"]},
-                        {"$set": ev},
-                        upsert=True,
-                    )
-                all_student_evaluations.extend(evaluations)
+            all_student_evaluations.extend(evaluations)
+            print(f"  ✓ {student_name}: {len(evaluations)} answers graded")
 
         await asyncio.sleep(2.0)  # Smooth transition
 
@@ -575,73 +633,6 @@ async def _apply_answer_key_grading(db, assessment_id: str, parsed_key: list, ev
                 "needsReview": ev.get("needsReview", True),
             }},
         )
-
-
-@router.get("/seed")
-async def seed_database(db=Depends(get_db)):
-    """Seed the database with demo data. Call this once after deployment."""
-    seed_dir = os.path.join(os.path.dirname(__file__), "..", "seed")
-
-    await db.curricula.delete_many({})
-    await db.assessments.delete_many({})
-    await db.questions.delete_many({})
-    await db.students.delete_many({})
-    await db.evaluations.delete_many({})
-    await db.interventions.delete_many({})
-    await db.users.delete_many({})
-
-    hashed = bcrypt.hashpw("demo1234".encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-    await db.users.insert_one({
-        "_id": "teacher-1",
-        "name": "Lakshmi Devi",
-        "email": "teacher@school.gov.in",
-        "school": "Z.P. High School, Hyderabad",
-        "subjects": ["Biology", "Physics"],
-        "password_hash": hashed,
-    })
-
-    curr_path = os.path.join(seed_dir, "curriculum", "ap-class8-bio.json")
-    if os.path.exists(curr_path):
-        with open(curr_path) as f:
-            await db.curricula.insert_one(json.load(f))
-
-    data_dir = os.path.join(seed_dir, "data")
-    for filename, collection_name in [
-        ("assessments.json", "assessments"),
-        ("questions.json", "questions"),
-        ("students.json", "students"),
-        ("evaluations.json", "evaluations"),
-        ("interventions.json", "interventions"),
-    ]:
-        filepath = os.path.join(data_dir, filename)
-        if not os.path.exists(filepath):
-            continue
-        with open(filepath) as f:
-            docs = json.load(f)
-        if isinstance(docs, dict):
-            items = []
-            for student_id, student_evals in docs.items():
-                for e in student_evals:
-                    e["_id"] = f"{student_id}-{e['qId']}"
-                    e["assessmentId"] = "asm-001"
-                    e["studentId"] = student_id
-                    e["approved"] = False
-                    items.append(e)
-            if items:
-                await db[collection_name].insert_many(items)
-        elif isinstance(docs, list):
-            for d in docs:
-                if "id" in d:
-                    d["_id"] = d.pop("id")
-                if collection_name != "assessments":
-                    d["assessmentId"] = "asm-001"
-            if docs:
-                await db[collection_name].insert_many(docs)
-
-    return {
-        "status": "ok",
-        "message": "Database seeded successfully. Login: teacher@school.gov.in / demo1234",
-    }
 
 
 @router.patch("/{id}", response_model=Assessment)

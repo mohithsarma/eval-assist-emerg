@@ -1,4 +1,5 @@
 from fastapi import FastAPI, APIRouter
+from fastapi.responses import FileResponse
 from starlette.middleware.cors import CORSMiddleware
 import os
 import logging
@@ -35,10 +36,20 @@ media_dir = os.path.join(os.path.dirname(__file__), "..", "media")
 if os.path.exists(media_dir):
     app.mount("/media", StaticFiles(directory=media_dir), name="media")
 
-# Serve frontend production build (SPA)
+# Serve frontend static assets (JS, CSS, images)
 frontend_build = os.path.join(os.path.dirname(__file__), "..", "frontend", "build")
-if os.path.exists(frontend_build):
-    app.mount("/", StaticFiles(directory=frontend_build, html=True), name="frontend")
+frontend_static = os.path.join(frontend_build, "static")
+if os.path.exists(frontend_static):
+    app.mount("/static", StaticFiles(directory=frontend_static), name="static")
+
+# SPA catch-all — all unmatched routes return index.html
+_index_html = os.path.join(frontend_build, "index.html")
+
+@app.get("/{full_path:path}")
+async def serve_spa(full_path: str):
+    if os.path.exists(_index_html):
+        return FileResponse(_index_html)
+    return {"error": "Frontend not built. Run: cd frontend && npm run build"}
 
 # Configure logging
 logging.basicConfig(
